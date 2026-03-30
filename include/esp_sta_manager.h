@@ -124,15 +124,15 @@ extern "C"
     .max_retry = STA_MGR_MAX_RETRY_DEFAULT, \
 }
 #elif defined(CONFIG_ESP_STA_MGR_PROV_SECURITY_2)
-#define STA_MANAGER_CONFIG_DEFAULT() {      \
-    .event_cb = NULL,                       \
-    .user_data = NULL,                      \
-    .service_name = NULL,                   \
-    .append_mac_suffix = false,             \
-    .sec2_salt = NULL,                      \
-    .sec2_salt_len = 0,                     \
-    .sec2_verifier = NULL,                  \
-    .sec2_verifier_len = 0,                 \
+#define STA_MANAGER_CONFIG_DEFAULT() { \
+    .event_cb = NULL,                  \
+    .user_data = NULL,                 \
+    .service_name = NULL,              \
+    .append_mac_suffix = false,        \
+    .sec2_salt = NULL,                 \
+    .sec2_salt_len = 0,                \
+    .sec2_verifier = NULL,             \
+    .sec2_verifier_len = 0,            \
 }
 #endif
 
