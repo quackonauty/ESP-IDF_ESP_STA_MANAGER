@@ -1,0 +1,125 @@
+menu "ESP STA Manager"
+
+    # -------------------------------------------------------------------------
+    # Provisioning Transport
+    # -------------------------------------------------------------------------
+
+    choice ESP_STA_MGR_PROV_TRANSPORT
+        prompt "Provisioning transport"
+        default ESP_STA_MGR_PROV_TRANSPORT_SOFTAP if IDF_TARGET_ESP32S2
+        default ESP_STA_MGR_PROV_TRANSPORT_BLE
+        help
+            Transport used during WiFi provisioning.
+            BLE:    recommended — lower power, modern smartphones.
+            SoftAP: legacy fallback — works without BLE support.
+
+        config ESP_STA_MGR_PROV_TRANSPORT_BLE
+            bool "BLE (Bluetooth Low Energy)"
+            depends on !IDF_TARGET_ESP32S2
+            select BT_ENABLED
+            select BTDM_CTRL_MODE_BLE_ONLY
+            select BT_NIMBLE_ENABLED
+
+        config ESP_STA_MGR_PROV_TRANSPORT_SOFTAP
+            bool "SoftAP (WiFi Access Point)"
+            select LWIP_IPV4
+
+    endchoice
+
+    # -------------------------------------------------------------------------
+    # Provisioning Security
+    # -------------------------------------------------------------------------
+
+    choice ESP_STA_MGR_PROV_SECURITY
+        prompt "Provisioning security level"
+        default ESP_STA_MGR_PROV_SECURITY_2
+        help
+            Security 1: X25519 key exchange + AES-CTR + Proof-of-Possession.
+            Security 2: SRP6a mutual authentication + AES-GCM (recommended).
+
+        config ESP_STA_MGR_PROV_SECURITY_1
+            bool "Security 1 (PoP)"
+            select ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1
+
+        config ESP_STA_MGR_PROV_SECURITY_2
+            bool "Security 2 — recommended (SRP6a)"
+            select ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_2
+
+    endchoice
+
+    # -------------------------------------------------------------------------
+    # Custom Provisioning Endpoint
+    #
+    # Registers a 'custom-data' endpoint available after the SRP handshake
+    # and before WiFi credentials are sent. Use it to exchange extra data
+    # (device info, activation tokens, initial config) with your own app.
+    # Leave disabled when using the standard ESP-IDF provisioning app.
+    # -------------------------------------------------------------------------
+
+    config ESP_STA_MGR_CUSTOM_ENDPOINT
+        bool "Enable custom provisioning data endpoint"
+        default n
+        help
+            Registers a 'custom-data' endpoint during provisioning.
+            Available after the SRP handshake, before WiFi credentials are sent.
+            Enable when building your own provisioning app and you need to
+            exchange extra data (device ID, activation token, initial config).
+            Leave disabled when using the standard ESP-IDF provisioning app.
+
+    # -------------------------------------------------------------------------
+    # Connection Retry
+    # -------------------------------------------------------------------------
+
+    config ESP_STA_MGR_RESET_ON_FAILURE
+        bool "Reset provisioning state on connection failure"
+        default y
+        help
+            After max attempts are exhausted, reset the provisioning state
+            machine so the user can re-provision with new credentials.
+
+    config ESP_STA_MGR_MAX_CONN_ATTEMPTS
+        int "Maximum connection attempts before reset"
+        default 5
+        range 1 20
+        depends on ESP_STA_MGR_RESET_ON_FAILURE
+        help
+            WiFi connection attempts before resetting the provisioning state
+            machine so the user can re-provision with new credentials.
+            Recommended: 3–5 for quick failure detection.
+
+    # -------------------------------------------------------------------------
+    # Log Level
+    # -------------------------------------------------------------------------
+
+    choice ESP_STA_MGR_LOG_LEVEL_CHOICE
+        prompt "Log level"
+        default ESP_STA_MGR_LOG_LEVEL_INFO
+        help
+            Component log verbosity. Levels below the selected threshold
+            are stripped at compile time — no code, no flash strings.
+
+        config ESP_STA_MGR_LOG_LEVEL_NONE
+            bool "None"
+        config ESP_STA_MGR_LOG_LEVEL_ERROR
+            bool "Error"
+        config ESP_STA_MGR_LOG_LEVEL_WARN
+            bool "Warn"
+        config ESP_STA_MGR_LOG_LEVEL_INFO
+            bool "Info"
+        config ESP_STA_MGR_LOG_LEVEL_DEBUG
+            bool "Debug"
+        config ESP_STA_MGR_LOG_LEVEL_VERBOSE
+            bool "Verbose"
+
+    endchoice
+
+    config ESP_STA_MGR_LOG_LEVEL
+        int
+        default 0 if ESP_STA_MGR_LOG_LEVEL_NONE
+        default 1 if ESP_STA_MGR_LOG_LEVEL_ERROR
+        default 2 if ESP_STA_MGR_LOG_LEVEL_WARN
+        default 3 if ESP_STA_MGR_LOG_LEVEL_INFO
+        default 4 if ESP_STA_MGR_LOG_LEVEL_DEBUG
+        default 5 if ESP_STA_MGR_LOG_LEVEL_VERBOSE
+
+endmenu
