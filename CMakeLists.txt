@@ -3,5 +3,5 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_REQUIRES
         esp_wifi
-        wifi_provisioning
+        network_provisioning
 )

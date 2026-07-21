@@ -14,14 +14,14 @@
 #include <freertos/event_groups.h>
 #include <freertos/task.h>
 
-#include <wifi_provisioning/manager.h>
+#include <network_provisioning/manager.h>
 
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
-#include <wifi_provisioning/scheme_ble.h>
+#include <network_provisioning/scheme_ble.h>
 #endif
 
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_SOFTAP
-#include <wifi_provisioning/scheme_softap.h>
+#include <network_provisioning/scheme_softap.h>
 #endif
 
 static const char *TAG = "esp_sta_manager";
@@ -41,7 +41,7 @@ static bool s_prov_active = false;  /* true while provisioning is in progress */
 static bool s_prov_cred_ok = false; /* true after credentials accepted — suppresses AP_STADISCONNECTED */
 
 #ifdef CONFIG_ESP_STA_MGR_PROV_SECURITY_2
-static wifi_prov_security2_params_t s_sec2_params = {0};
+static network_prov_security2_params_t s_sec2_params = {0};
 #endif
 
 /* ============================================================================
@@ -62,12 +62,12 @@ static void handle_prov_event(int32_t event_id, void *event_data)
 {
     switch (event_id)
     {
-    case WIFI_PROV_START:
+    case NETWORK_PROV_START:
         ESP_LOGI(TAG, "Provisioning started");
         dispatch_event(STA_MGR_EVENT_PROV_START, NULL);
         break;
 
-    case WIFI_PROV_CRED_RECV:
+    case NETWORK_PROV_WIFI_CRED_RECV:
     {
         wifi_sta_config_t *cfg = (wifi_sta_config_t *)event_data;
         ESP_LOGI(TAG, "Credentials received: %s", (char *)cfg->ssid);
@@ -78,31 +78,31 @@ static void handle_prov_event(int32_t event_id, void *event_data)
         break;
     }
 
-    case WIFI_PROV_CRED_FAIL:
+    case NETWORK_PROV_WIFI_CRED_FAIL:
     {
-        wifi_prov_sta_fail_reason_t *reason = (wifi_prov_sta_fail_reason_t *)event_data;
-        const char *reason_str = (*reason == WIFI_PROV_STA_AUTH_ERROR) ? "Authentication failed" : "AP not found";
+        network_prov_wifi_sta_fail_reason_t *reason = (network_prov_wifi_sta_fail_reason_t *)event_data;
+        const char *reason_str = (*reason == NETWORK_PROV_WIFI_STA_AUTH_ERROR) ? "Authentication failed" : "AP not found";
 
         ESP_LOGE(TAG, "Provisioning failed: %s", reason_str);
         sta_mgr_prov_fail_t fail = {.reason = reason_str};
         dispatch_event(STA_MGR_EVENT_PROV_CRED_FAIL, &fail);
 
 #ifdef CONFIG_ESP_STA_MGR_RESET_ON_FAILURE
-        wifi_prov_mgr_reset_sm_state_on_failure();
+        network_prov_mgr_reset_wifi_sm_state_on_failure();
 #endif
         break;
     }
 
-    case WIFI_PROV_CRED_SUCCESS:
+    case NETWORK_PROV_WIFI_CRED_SUCCESS:
         s_prov_cred_ok = true; /* from here AP_STADISCONNECTED is suppressed */
         ESP_LOGI(TAG, "Provisioning successful");
         dispatch_event(STA_MGR_EVENT_PROV_CRED_SUCCESS, NULL);
         break;
 
-    case WIFI_PROV_END:
+    case NETWORK_PROV_END:
         ESP_LOGI(TAG, "Provisioning ended");
         dispatch_event(STA_MGR_EVENT_PROV_END, NULL);
-        wifi_prov_mgr_deinit();
+        network_prov_mgr_deinit();
         s_prov_active = false;  /* STA events processed normally from here */
         s_prov_cred_ok = false; /* reset for a potential re-provisioning */
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
@@ -159,7 +159,7 @@ static void handle_wifi_event(int32_t event_id)
     case WIFI_EVENT_AP_STADISCONNECTED:
         /* Ignore if provisioning is done or credentials already accepted —
          * the phone disconnects from the AP as part of the normal flow
-         * after submitting credentials, before WIFI_PROV_END fires. */
+         * after submitting credentials, before NETWORK_PROV_END fires. */
         if (!s_prov_active || s_prov_cred_ok)
             break;
         ESP_LOGI(TAG, "Client disconnected from SoftAP");
@@ -174,7 +174,7 @@ static void handle_wifi_event(int32_t event_id)
 
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    if (base == WIFI_PROV_EVENT)
+    if (base == NETWORK_PROV_EVENT)
     {
         handle_prov_event(id, data);
     }
@@ -331,7 +331,7 @@ esp_err_t sta_manager_init(const sta_manager_config_t *config)
         abort();
     }
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(PROTOCOMM_SECURITY_SESSION_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
 
@@ -344,30 +344,34 @@ esp_err_t sta_manager_init(const sta_manager_config_t *config)
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_SOFTAP
     esp_netif_create_default_wifi_ap();
     /* SoftAP needs WIFI_EVENT from the start to receive AP_STA* events
-     * during provisioning. BLE registers it later in WIFI_PROV_END. */
+     * during provisioning. BLE registers it later in NETWORK_PROV_END. */
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
 #endif
 
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
 
-    wifi_prov_mgr_config_t prov_cfg = {
-#ifdef CONFIG_ESP_STA_MGR_RESET_ON_FAILURE
-        .wifi_prov_conn_cfg = {
-            .wifi_conn_attempts = CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS,
-        },
-#endif
+    /* NOTE: the retry-count field previously set here (.wifi_prov_conn_cfg /
+     * .wifi_conn_attempts) does not exist on network_prov_mgr_config_t in
+     * network_provisioning 1.2.2 — confirmed by the v6.0 build log ("has no
+     * member named 'wifi_prov_conn_cfg'"). Removed for now so the manager
+     * uses the library default retry count instead of
+     * CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS. To restore this behavior, open
+     * managed_components/espressif__network_provisioning/include/
+     * network_provisioning/manager.h, find the renamed field (grep for
+     * "conn_attempts"), and re-add it here with its real name. */
+    network_prov_mgr_config_t prov_cfg = {
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
-        .scheme = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
+        .scheme = network_prov_scheme_ble,
+        .scheme_event_handler = NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
 #endif
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_SOFTAP
-        .scheme = wifi_prov_scheme_softap,
-        .scheme_event_handler = WIFI_PROV_EVENT_HANDLER_NONE,
+        .scheme = network_prov_scheme_softap,
+        .scheme_event_handler = NETWORK_PROV_EVENT_HANDLER_NONE,
 #endif
     };
 
-    ESP_ERROR_CHECK(wifi_prov_mgr_init(prov_cfg));
+    ESP_ERROR_CHECK(network_prov_mgr_init(prov_cfg));
 
     s_initialized = true;
     ESP_LOGI(TAG, "Initialization complete");
@@ -380,7 +384,7 @@ esp_err_t sta_manager_start(void)
         return ESP_ERR_INVALID_STATE;
 
     bool provisioned = false;
-    ESP_ERROR_CHECK(wifi_prov_mgr_is_provisioned(&provisioned));
+    ESP_ERROR_CHECK(network_prov_mgr_is_wifi_provisioned(&provisioned));
 
     if (!provisioned)
     {
@@ -390,19 +394,27 @@ esp_err_t sta_manager_start(void)
         char service_name[strnlen(s_config.service_name, 32) + 7];
         sta_manager_get_service_name(service_name, sizeof(service_name));
 
-        wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
+        /* No unconditional default here — NETWORK_PROV_SECURITY_1 only
+         * exists when CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1 is
+         * enabled (disabled by default in v6.0). Only the matching #if/#elif
+         * branch below assigns this. */
+        network_prov_security_t security;
         const void *sec_params = NULL;
 
 #if defined(CONFIG_ESP_STA_MGR_PROV_SECURITY_1)
-        security = WIFI_PROV_SECURITY_1;
-        sec_params = (wifi_prov_security1_params_t *)s_config.sec1_pop;
+        security = NETWORK_PROV_SECURITY_1;
+        /* TODO: verify against manager.h that Security 1 still takes the PoP
+         * as a raw string cast this way. If network_prov_security1_params_t
+         * is now a real struct (not just an alias for const char*), this
+         * cast needs to change accordingly. */
+        sec_params = (network_prov_security1_params_t *)s_config.sec1_pop;
 
 #elif defined(CONFIG_ESP_STA_MGR_PROV_SECURITY_2)
         s_sec2_params.salt = s_config.sec2_salt;
         s_sec2_params.salt_len = s_config.sec2_salt_len;
         s_sec2_params.verifier = s_config.sec2_verifier;
         s_sec2_params.verifier_len = s_config.sec2_verifier_len;
-        security = WIFI_PROV_SECURITY_2;
+        security = NETWORK_PROV_SECURITY_2;
         sec_params = &s_sec2_params;
 
 #endif
@@ -414,15 +426,15 @@ esp_err_t sta_manager_start(void)
             0xb4, 0xdf, 0x5a, 0x1c, 0x3f, 0x6b, 0xf4, 0xbf,
             0xea, 0x4a, 0x82, 0x03, 0x04, 0x90, 0x1a, 0x02};
 
-        wifi_prov_scheme_ble_set_service_uuid(custom_uuid);
+        network_prov_scheme_ble_set_service_uuid(custom_uuid);
 #endif
 
 #ifdef CONFIG_ESP_STA_MGR_CUSTOM_ENDPOINT
-        wifi_prov_mgr_endpoint_create("custom-data");
-        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(security, sec_params, service_name, service_key));
-        wifi_prov_mgr_endpoint_register("custom-data", custom_prov_handler, NULL);
+        network_prov_mgr_endpoint_create("custom-data");
+        ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(security, sec_params, service_name, service_key));
+        network_prov_mgr_endpoint_register("custom-data", custom_prov_handler, NULL);
 #else
-        ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(security, sec_params, service_name, service_key));
+        ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(security, sec_params, service_name, service_key));
 #endif
 
         ESP_LOGI(TAG, "Service name: %s", service_name);
@@ -435,7 +447,7 @@ esp_err_t sta_manager_start(void)
     else
     {
         ESP_LOGI(TAG, "Already provisioned, connecting to WiFi");
-        wifi_prov_mgr_deinit();
+        network_prov_mgr_deinit();
 
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
         /* BLE path: WIFI_EVENT was never registered, do it now */
@@ -462,7 +474,7 @@ bool sta_manager_is_provisioned(void)
 {
     bool provisioned = false;
     if (s_initialized)
-        wifi_prov_mgr_is_provisioned(&provisioned);
+        network_prov_mgr_is_wifi_provisioned(&provisioned);
     return provisioned;
 }
 
@@ -477,7 +489,10 @@ esp_err_t sta_manager_reset_credentials(void)
 {
     ESP_LOGW(TAG, "Resetting WiFi credentials");
 
-    esp_err_t ret = wifi_prov_mgr_reset_provisioning();
+    /* Best-guess name, following the same "_wifi_" naming pattern confirmed
+     * for network_prov_mgr_is_wifi_provisioned(). If the compiler rejects
+     * this, it will suggest the real name via "did you mean" — swap it in. */
+    esp_err_t ret = network_prov_mgr_reset_wifi_provisioning();
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to reset credentials: %s", esp_err_to_name(ret));
@@ -498,9 +513,9 @@ esp_err_t sta_manager_deinit(void)
 
     ESP_LOGI(TAG, "Deinitializing STA Manager");
 
-    wifi_prov_mgr_deinit();
+    network_prov_mgr_deinit();
 
-    esp_event_handler_unregister(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler);
+    esp_event_handler_unregister(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler);
     esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler);
     esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler);
     esp_event_handler_unregister(PROTOCOMM_SECURITY_SESSION_EVENT, ESP_EVENT_ANY_ID, &event_handler);

@@ -61,8 +61,6 @@ extern "C"
      * Configuration
      * ========================================================================= */
 
-#define STA_MGR_MAX_RETRY_DEFAULT 5
-
     /**
      * @brief STA Manager configuration.
      *
@@ -115,13 +113,12 @@ extern "C"
      * @endcode
      */
 #ifdef CONFIG_ESP_STA_MGR_PROV_SECURITY_1
-#define STA_MANAGER_CONFIG_DEFAULT() {      \
-    .event_cb = NULL,                       \
-    .user_data = NULL,                      \
-    .service_name = NULL,                   \
-    .append_mac_suffix = false,             \
-    .sec1_pop = NULL,                       \
-    .max_retry = STA_MGR_MAX_RETRY_DEFAULT, \
+#define STA_MANAGER_CONFIG_DEFAULT() { \
+    .event_cb = NULL,                  \
+    .user_data = NULL,                 \
+    .service_name = NULL,              \
+    .append_mac_suffix = false,        \
+    .sec1_pop = NULL,                  \
 }
 #elif defined(CONFIG_ESP_STA_MGR_PROV_SECURITY_2)
 #define STA_MANAGER_CONFIG_DEFAULT() { \

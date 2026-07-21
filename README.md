@@ -3,15 +3,17 @@
 | Supported Targets | ESP32 | ESP32-S2 | ESP32-S3 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 |
 | ----------------- | ----- | -------- | -------- | -------- | -------- | -------- | -------- | --------- | -------- |
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-2.0.0-blue)
 
 An ESP-IDF component that handles WiFi provisioning (BLE or SoftAP) and the full connection lifecycle — including automatic reconnection and event-driven state callbacks.
 
 ## Requirements
 
-- **ESP-IDF**: v5.0+
+- **ESP-IDF**: v6.0+ (uses `network_provisioning`, the replacement for the deprecated `wifi_provisioning` component — see [Changelog](#changelog))
 - **Flash**: 4 MB minimum
 - **RAM**: ~93 KB peak (SoftAP provisioning) / ~76 KB steady state
+
+> **Coming from v1.x on ESP-IDF v5?** Stay on the `1.0.0` tag — v2.0.0 is not backward compatible with ESP-IDF < v6.0.
 
 ---
 
@@ -34,10 +36,10 @@ sta_manager_start()
     │                           │ s_prov_active = true (STA events blocked)
     │                           │ waiting for provisioning app...
     │                           │
-    │                           WIFI_PROV_CRED_RECV
-    │                           WIFI_PROV_CRED_SUCCESS  ← s_prov_cred_ok = true
-    │                           │                         AP_STADISCONNECTED suppressed
-    │                           WIFI_PROV_END
+    │                           NETWORK_PROV_WIFI_CRED_RECV
+    │                           NETWORK_PROV_WIFI_CRED_SUCCESS  ← s_prov_cred_ok = true
+    │                           │                                 AP_STADISCONNECTED suppressed
+    │                           NETWORK_PROV_END
     │                           │ deinit prov_mgr
     │                           │ s_prov_active = false
     │                           │ register WIFI_EVENT (BLE only — lazy)
@@ -60,7 +62,7 @@ sta_manager_start()
 - `service_name` and `append_mac_suffix` are runtime config — no Kconfig string fields needed for naming.
 - `WIFI_EVENT` registration strategy differs by transport: SoftAP registers at `init()` (needed immediately for AP events); BLE registers lazily after provisioning ends to avoid interfering with `prov_mgr`'s internal STA handling.
 - `s_prov_active` flag gates all STA events during provisioning — prevents spurious `esp_wifi_connect()` calls while the AP is active.
-- `s_prov_cred_ok` flag suppresses `AP_STADISCONNECTED` after credentials are accepted — the phone disconnects from the SoftAP as part of the normal flow before `WIFI_PROV_END` fires.
+- `s_prov_cred_ok` flag suppresses `AP_STADISCONNECTED` after credentials are accepted — the phone disconnects from the SoftAP as part of the normal flow before `NETWORK_PROV_END` fires.
 - `STA_CONNECTED_BIT` is never cleared on `wait_connected()` exit, keeping `sta_manager_is_connected()` accurate after the wait returns.
 
 ---
@@ -119,7 +121,7 @@ Both cores share the same RAM heap and peripherals — use mutexes when accessin
 ### Step 1: Add Component
 
 ```bash
-idf.py add-dependency --git https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git --git-ref 1.0.0 qck_esp_sta_manager
+idf.py add-dependency --git https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git --git-ref 2.0.0 qck_esp_sta_manager
 ```
 
 Or in `main/idf_component.yml`:
@@ -128,7 +130,7 @@ Or in `main/idf_component.yml`:
 dependencies:
   qck_esp_sta_manager:
     git: https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git
-    version: 1.0.0
+    version: 2.0.0
 ```
 
 ### Step 2: Partition Table
@@ -506,7 +508,7 @@ Each device has unique credentials stored in the `mfg_data` partition.
 #include "nvs.h"
 
 /* Static buffers — must outlive sta_manager_start() since prov_mgr holds
- * pointers until WIFI_PROV_END, which fires after the STA connects. */
+ * pointers until NETWORK_PROV_END, which fires after the STA connects. */
 static uint8_t s_salt[16];
 static uint8_t s_verifier[384];
 
@@ -731,7 +733,7 @@ typedef struct {
 } sta_manager_config_t;
 ```
 
-> **Note**: `service_name`, `sec2_salt`, and `sec2_verifier` must point to persistent memory (static arrays or string literals) that remains valid until `WIFI_PROV_END` fires.
+> **Note**: `service_name`, `sec2_salt`, and `sec2_verifier` must point to persistent memory (static arrays or string literals) that remains valid until `NETWORK_PROV_END` fires.
 
 Default macro — all fields that must be set are initialized to `NULL`/`0` to force explicit assignment:
 
@@ -806,9 +808,20 @@ $IDF_PATH/components/esptool_py/esptool/esptool.py erase_region 0x9000 0x6000
 
 **OLED or callback shows spurious "Client Disconnected" after WiFi connects (SoftAP)**: Upgrade to v1.0.0 — this was fixed with the `s_prov_cred_ok` flag that suppresses `AP_STADISCONNECTED` after credentials are accepted.
 
+**`Max connection attempts` (`CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS`) seems to have no effect (v2.0.0+)**: Known limitation. `network_prov_mgr_config_t` in `network_provisioning` 1.2.2 no longer exposes a retry-count field equivalent to the old `wifi_prov_conn_cfg`/`wifi_conn_attempts` from `wifi_provisioning`. The Kconfig option is kept for a future fix but currently doesn't influence the provisioning manager's retry count.
+
 ---
 
 ## Changelog
+
+### 2.0.0
+
+- **Breaking**: migrated from the deprecated `wifi_provisioning` component to `network_provisioning`, required for ESP-IDF v6.0+ compatibility. All `wifi_prov_*` types/functions used internally were replaced with their `network_prov_*` equivalents.
+- **Breaking**: minimum supported ESP-IDF version raised to **v6.0**. Projects on ESP-IDF v5.x should stay on the `1.0.0` tag.
+- `idf_component.yml` dependency updated from `espressif/wifi_provisioning` to `espressif/network_provisioning`.
+- **Fix**: removed a leftover `.max_retry` field from `STA_MANAGER_CONFIG_DEFAULT()` (Security 1 branch) in `esp_sta_manager.h`. The `max_retry` member was already removed from `sta_manager_config_t` in `1.0.0`, but the default-config macro still referenced it, which failed to compile whenever `CONFIG_ESP_STA_MGR_PROV_SECURITY_1` was enabled.
+- Removed the now-unused `STA_MGR_MAX_RETRY_DEFAULT` macro.
+- **Known limitation**: `CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS` currently has no effect on provisioning retry behavior — `network_prov_mgr_config_t` (network_provisioning 1.2.2) dropped the retry-count field that `wifi_prov_mgr_config_t` used to expose. See [Troubleshooting](#troubleshooting).
 
 ### 1.0.0
 
