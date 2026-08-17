@@ -3,7 +3,7 @@
 | Supported Targets | ESP32 | ESP32-S2 | ESP32-S3 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 |
 | ----------------- | ----- | -------- | -------- | -------- | -------- | -------- | -------- | --------- | -------- |
 
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
+![Version](https://img.shields.io/badge/version-2.1.0-blue)
 
 An ESP-IDF component that handles WiFi provisioning (BLE or SoftAP) and the full connection lifecycle — including automatic reconnection and event-driven state callbacks.
 
@@ -121,7 +121,7 @@ Both cores share the same RAM heap and peripherals — use mutexes when accessin
 ### Step 1: Add Component
 
 ```bash
-idf.py add-dependency --git https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git --git-ref 2.0.0 qck_esp_sta_manager
+idf.py add-dependency --git https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git --git-ref 2.1.0 qck_esp_sta_manager
 ```
 
 Or in `main/idf_component.yml`:
@@ -130,7 +130,7 @@ Or in `main/idf_component.yml`:
 dependencies:
   qck_esp_sta_manager:
     git: https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git
-    version: 2.0.0
+    version: 2.1.0
 ```
 
 ### Step 2: Partition Table
@@ -185,6 +185,8 @@ Mobile apps:
 
 Steps: flash firmware → open app → connect to `PROV_XXXXXX` → enter WiFi credentials.
 
+> **Reusing this component across products?** Set `cfg.ble_service_uuid` to a UUID unique to that product (see [Configuration](#configuration)). Every device otherwise advertises the same built-in default UUID, which is fine for a single product but means two different products built on this component are indistinguishable over BLE.
+
 ### SoftAP
 
 Enable in `idf.py menuconfig` → Component config → ESP STA Manager → Provisioning transport → SoftAP. Required for ESP32-S2 (no BLE).
@@ -204,8 +206,9 @@ Navigate to: **Component config → ESP STA Manager**
 | Provisioning transport | BLE | BLE or SoftAP |
 | Provisioning security | Security 2 | SRP6a (recommended) or PoP |
 | Custom endpoint | Disabled | Extra data endpoint for custom provisioning apps |
-| Reset on failure | Enabled | Re-enters provisioning after max retries |
-| Max connection attempts | 5 | Retries before provisioning reset (visible only when reset is enabled) |
+| Reset on failure | Enabled | Clears stored credentials after `Max connection attempts` consecutive credential-type disconnects |
+| Max connection attempts | 5 | Consecutive auth/AP-not-found disconnects (operational reconnects, not provisioning) before credentials are cleared — visible only when reset is enabled |
+| SoftAP password | *(empty)* | WPA2 password for the SoftAP network itself (SoftAP transport only) — empty means an open network. Independent of the Security 1/2 protocomm encryption |
 | Log level | Info | Component verbosity |
 
 > **Service name and MAC suffix** are configured at runtime via `sta_manager_config_t` — not in Kconfig. This ensures the caller always sets them explicitly.
@@ -720,6 +723,12 @@ typedef struct {
                                     ///< Must point to persistent memory (static or literal)
     bool append_mac_suffix;         ///< Append last 3 MAC bytes to service_name for uniqueness
 
+#ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
+    const uint8_t *ble_service_uuid; ///< 16-byte BLE service UUID. NULL = built-in default.
+                                     ///< Give each product its own UUID if this component
+                                     ///< is reused across more than one product.
+#endif
+
 #ifdef CONFIG_ESP_STA_MGR_PROV_SECURITY_1
     const char *sec1_pop;           ///< Proof of Possession string — required for Sec1
 #endif
@@ -763,7 +772,8 @@ cfg.sec2_verifier_len = sizeof(s_verifier);
 | `STA_MGR_EVENT_STA_CONNECTING` | Attempting to connect to AP | `NULL` |
 | `STA_MGR_EVENT_STA_CONNECTED` | Associated with AP (no IP yet) | `NULL` |
 | `STA_MGR_EVENT_STA_GOT_IP` | IP address acquired | `sta_mgr_ip_info_t*` |
-| `STA_MGR_EVENT_STA_DISCONNECTED` | Lost connection, reconnect triggered | `NULL` |
+| `STA_MGR_EVENT_STA_DISCONNECTED` | Lost connection, reconnect triggered | `sta_mgr_disconnect_t*` |
+| `STA_MGR_EVENT_RECONNECT_EXHAUSTED` | `CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS` consecutive credential-type disconnects — stored credentials were just cleared (requires `CONFIG_ESP_STA_MGR_RESET_ON_FAILURE`) | `NULL` |
 | `STA_MGR_EVENT_BLE_CONNECTED` | BLE client connected (BLE transport only) | `NULL` |
 | `STA_MGR_EVENT_BLE_DISCONNECTED` | BLE client disconnected (BLE transport only) | `NULL` |
 | `STA_MGR_EVENT_AP_CLIENT_CONNECTED` | Client joined SoftAP (SoftAP transport only) | `NULL` |
@@ -778,6 +788,8 @@ typedef struct { char ssid[33]; } sta_mgr_prov_cred_t;
 
 typedef struct { const char *reason; } sta_mgr_prov_fail_t;
 
+typedef struct { uint16_t reason; } sta_mgr_disconnect_t; ///< raw wifi_err_reason_t code
+
 typedef struct {
     char ip[16];
     char netmask[16];
@@ -785,6 +797,21 @@ typedef struct {
     char ssid[33];
 } sta_mgr_ip_info_t;
 ```
+
+---
+
+## Handling Reconnect Exhaustion
+
+After provisioning has completed once, `CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS` (default 5) also governs *operational* reconnects: if the component sees that many consecutive disconnects whose reason code points to a credentials/AP problem (wrong password, AP not found, handshake timeout, ...) rather than a transient signal issue, it clears the stored WiFi credentials and dispatches `STA_MGR_EVENT_RECONNECT_EXHAUSTED`. It does **not** restart the device — that decision is left to the app:
+
+```c
+case STA_MGR_EVENT_RECONNECT_EXHAUSTED:
+    ESP_LOGW("app", "Repeated auth failures — credentials cleared, restarting into provisioning");
+    esp_restart();
+    break;
+```
+
+Transient disconnects (e.g. the AP briefly going out of range) don't count toward this limit — the streak resets on any disconnect whose reason isn't credentials-related, and on every successful `STA_MGR_EVENT_STA_GOT_IP`.
 
 ---
 
@@ -808,11 +835,22 @@ $IDF_PATH/components/esptool_py/esptool/esptool.py erase_region 0x9000 0x6000
 
 **OLED or callback shows spurious "Client Disconnected" after WiFi connects (SoftAP)**: Upgrade to v1.0.0 — this was fixed with the `s_prov_cred_ok` flag that suppresses `AP_STADISCONNECTED` after credentials are accepted.
 
-**`Max connection attempts` (`CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS`) seems to have no effect (v2.0.0+)**: Known limitation. `network_prov_mgr_config_t` in `network_provisioning` 1.2.2 no longer exposes a retry-count field equivalent to the old `wifi_prov_conn_cfg`/`wifi_conn_attempts` from `wifi_provisioning`. The Kconfig option is kept for a future fix but currently doesn't influence the provisioning manager's retry count.
+**`Max connection attempts` (`CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS`) doesn't seem to do anything**: Make sure `CONFIG_ESP_STA_MGR_RESET_ON_FAILURE` is enabled — the counter only applies to *operational* reconnects after provisioning has completed once (wrong password entered during the provisioning flow itself is still reported once via `STA_MGR_EVENT_PROV_CRED_FAIL`, independent of this counter). See [Handling Reconnect Exhaustion](#handling-reconnect-exhaustion).
 
 ---
 
 ## Changelog
+
+### 2.1.0
+
+- **New**: `CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS` is now actually wired up. Previously declared in Kconfig but never read anywhere in the source — see the 2.0.0 "Known limitation" note below, now resolved differently than originally expected: instead of feeding a retry-count field that `network_prov_mgr_config_t` no longer exposes, it now counts consecutive *credential-type* disconnects during operational reconnects (post-provisioning) and clears stored credentials once the limit is hit.
+- **New**: `STA_MGR_EVENT_RECONNECT_EXHAUSTED` event — dispatched when the above limit is reached, after credentials are cleared. See [Handling Reconnect Exhaustion](#handling-reconnect-exhaustion).
+- **New**: `STA_MGR_EVENT_STA_DISCONNECTED` now carries a `sta_mgr_disconnect_t*` with the raw `wifi_err_reason_t` code instead of `NULL`, so the app can distinguish an auth problem from a transient signal issue if it wants to. Source-compatible for existing handlers that ignore `event_data` on this event.
+- **New**: `ble_service_uuid` field on `sta_manager_config_t` (BLE transport only) — lets each product using this component advertise its own 16-byte service UUID instead of the shared built-in default. `NULL` keeps the previous behavior.
+- **New**: `CONFIG_ESP_STA_MGR_SOFTAP_PASSWORD` Kconfig option — optional WPA2 password for the SoftAP network itself during provisioning (SoftAP transport only). Empty by default, preserving the previous open-network behavior.
+- **Fix**: `CMakeLists.txt` was missing `esp_timer` in `PRIV_REQUIRES` despite the source calling `esp_timer_create()`/`esp_timer_start_once()` directly; only worked before because `esp_timer` was pulled in transitively through another dependency.
+- **Docs**: header now documents that the component is not thread-safe (state is written both from the caller's task and from the default event-loop task).
+- No breaking changes — existing `sta_manager_config_t` initializers and event handlers compile and run unchanged.
 
 ### 2.0.0
 

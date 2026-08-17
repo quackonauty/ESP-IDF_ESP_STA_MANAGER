@@ -26,6 +26,16 @@ menu "ESP STA Manager"
 
     endchoice
 
+    config ESP_STA_MGR_SOFTAP_PASSWORD
+        string "SoftAP password (empty = open network)"
+        default ""
+        depends on ESP_STA_MGR_PROV_TRANSPORT_SOFTAP
+        help
+            WPA2 password for the provisioning SoftAP network itself (min. 8
+            characters if set — leave empty for an open network). This is
+            separate from the Security 1/2 protocomm encryption above, which
+            protects the credential exchange either way.
+
     # -------------------------------------------------------------------------
     # Provisioning Security
     # -------------------------------------------------------------------------
@@ -78,14 +88,47 @@ menu "ESP STA Manager"
             machine so the user can re-provision with new credentials.
 
     config ESP_STA_MGR_MAX_CONN_ATTEMPTS
-        int "Maximum connection attempts before reset"
+        int "Consecutive credential-type failures before clearing credentials"
         default 5
         range 1 20
         depends on ESP_STA_MGR_RESET_ON_FAILURE
         help
-            WiFi connection attempts before resetting the provisioning state
-            machine so the user can re-provision with new credentials.
+            Applies to OPERATIONAL reconnects, after provisioning has already
+            completed once (e.g. the router's password changed later). The
+            component counts consecutive disconnects whose reason code points
+            to a credentials/AP problem (auth failure, AP not found, handshake
+            timeout, ...) rather than a transient signal issue. Once this many
+            happen in a row, stored WiFi credentials are cleared and
+            STA_MGR_EVENT_RECONNECT_EXHAUSTED is dispatched so the app can
+            react (e.g. reboot into provisioning mode).
             Recommended: 3–5 for quick failure detection.
+
+    # -------------------------------------------------------------------------
+    # Reconnect Backoff
+    #
+    # Applies to operational reconnects (after provisioning is done), not to
+    # the provisioning phase above. The network_provisioning component has
+    # no built-in retry/backoff, so it's handled here with a simple
+    # exponential backoff: base delay, doubling on each failure, capped at
+    # max delay. Resets to base delay as soon as an IP is acquired.
+    # -------------------------------------------------------------------------
+
+    config ESP_STA_MGR_RECONNECT_BASE_DELAY_MS
+        int "Base reconnect delay (ms)"
+        default 1000
+        range 200 10000
+        help
+            Delay before the first automatic reconnect attempt after a
+            disconnection. Doubles on each consecutive failure, up to
+            the maximum delay below.
+
+    config ESP_STA_MGR_RECONNECT_MAX_DELAY_MS
+        int "Maximum reconnect delay (ms)"
+        default 30000
+        range 1000 120000
+        help
+            Upper bound for the exponential backoff delay between
+            automatic reconnect attempts.
 
     # -------------------------------------------------------------------------
     # Log Level

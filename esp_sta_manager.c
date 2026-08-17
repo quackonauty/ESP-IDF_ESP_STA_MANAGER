@@ -3,11 +3,13 @@
 #include "esp_sta_manager.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <string.h>
 
 #include <esp_event.h>
 #include <esp_log.h>
 #include <esp_netif.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 
 #include <freertos/FreeRTOS.h>
@@ -33,12 +35,13 @@ static const char *TAG = "esp_sta_manager";
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
 
 #define STA_CONNECTED_BIT BIT0
+#define SERVICE_NAME_MAX_LEN 40 /* prefix + 6 hex MAC chars, fixed size (no VLA) */
 
 static EventGroupHandle_t s_sta_event_group = NULL;
 static sta_manager_config_t s_config = {0};
 static bool s_initialized = false;
 static bool s_prov_active = false;  /* true while provisioning is in progress */
-static bool s_prov_cred_ok = false; /* true after credentials accepted — suppresses AP_STADISCONNECTED */
+static bool s_prov_cred_ok = false; /* true once credentials are accepted — suppresses AP_STADISCONNECTED */
 
 #ifdef CONFIG_ESP_STA_MGR_PROV_SECURITY_2
 static network_prov_security2_params_t s_sec2_params = {0};
@@ -52,6 +55,71 @@ static inline void dispatch_event(sta_mgr_event_t event, void *data)
 {
     if (s_config.event_cb)
         s_config.event_cb(s_config.user_data, event, data);
+}
+
+/* ============================================================================
+ * Reconnect Backoff
+ *
+ * network_prov_mgr_config_t (network_provisioning component) exposes no
+ * retry/backoff field — that field only existed on the legacy
+ * wifi_provisioning component, and even there it only covered attempts
+ * made *during* provisioning, not operational reconnects. So this is
+ * handled at app level: on disconnect, an esp_timer schedules the next
+ * esp_wifi_connect() with exponential backoff instead of retrying
+ * immediately. A one-shot timer is used instead of a dedicated task to
+ * avoid the extra stack/RAM cost.
+ * ========================================================================= */
+
+static esp_timer_handle_t s_reconnect_timer = NULL;
+static uint8_t s_reconnect_attempts = 0;
+
+/* Consecutive *credential-type* disconnects (wrong password, AP not found,
+ * handshake timeout, ...) counted only for OPERATIONAL reconnects, i.e.
+ * after provisioning has already completed once. Unrelated to the
+ * provisioning-time NETWORK_PROV_WIFI_CRED_FAIL path below, which is a
+ * separate, one-shot failure reported by the provisioning manager itself. */
+static uint8_t s_auth_fail_count = 0;
+
+static void reconnect_timer_cb(void *arg)
+{
+    ESP_LOGI(TAG, "Reconnect attempt #%u", s_reconnect_attempts);
+    dispatch_event(STA_MGR_EVENT_STA_CONNECTING, NULL);
+    esp_wifi_connect();
+}
+
+/* True for wifi_err_reason_t codes that indicate the stored credentials (or
+ * the AP itself) are the problem, as opposed to a transient RF/signal issue.
+ * Only these count toward CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS. */
+static inline bool is_credential_failure_reason(uint8_t reason)
+{
+    switch (reason)
+    {
+    case WIFI_REASON_AUTH_EXPIRE:
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_ASSOC_NOT_AUTHED:
+    case WIFI_REASON_ASSOC_FAIL:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_MIC_FAILURE:
+    case WIFI_REASON_NO_AP_FOUND:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void schedule_reconnect(void)
+{
+    uint32_t delay_ms = CONFIG_ESP_STA_MGR_RECONNECT_BASE_DELAY_MS << s_reconnect_attempts;
+
+    if (delay_ms > CONFIG_ESP_STA_MGR_RECONNECT_MAX_DELAY_MS || delay_ms == 0 /* overflow */)
+        delay_ms = CONFIG_ESP_STA_MGR_RECONNECT_MAX_DELAY_MS;
+
+    if (s_reconnect_attempts < 16) /* cap the shift; delay is already clamped above */
+        s_reconnect_attempts++;
+
+    ESP_LOGW(TAG, "WiFi disconnected, retrying in %" PRIu32 " ms", delay_ms);
+    esp_timer_stop(s_reconnect_timer); /* no-op if not running */
+    esp_timer_start_once(s_reconnect_timer, (uint64_t)delay_ms * 1000);
 }
 
 /* ============================================================================
@@ -94,7 +162,7 @@ static void handle_prov_event(int32_t event_id, void *event_data)
     }
 
     case NETWORK_PROV_WIFI_CRED_SUCCESS:
-        s_prov_cred_ok = true; /* from here AP_STADISCONNECTED is suppressed */
+        s_prov_cred_ok = true; /* AP_STADISCONNECTED is suppressed from here on */
         ESP_LOGI(TAG, "Provisioning successful");
         dispatch_event(STA_MGR_EVENT_PROV_CRED_SUCCESS, NULL);
         break;
@@ -104,9 +172,9 @@ static void handle_prov_event(int32_t event_id, void *event_data)
         dispatch_event(STA_MGR_EVENT_PROV_END, NULL);
         network_prov_mgr_deinit();
         s_prov_active = false;  /* STA events processed normally from here */
-        s_prov_cred_ok = false; /* reset for a potential re-provisioning */
+        s_prov_cred_ok = false; /* reset in case of a future re-provisioning */
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
-        /* BLE did not register WIFI_EVENT in init() — do it now */
+        /* BLE transport doesn't register WIFI_EVENT in init() — do it now */
         ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
 #endif
         break;
@@ -116,7 +184,7 @@ static void handle_prov_event(int32_t event_id, void *event_data)
     }
 }
 
-static void handle_wifi_event(int32_t event_id)
+static void handle_wifi_event(int32_t event_id, void *event_data)
 {
     switch (event_id)
     {
@@ -125,9 +193,10 @@ static void handle_wifi_event(int32_t event_id)
         if (s_prov_active)
             break;
         ESP_LOGI(TAG, "WiFi STA started");
+        s_reconnect_attempts = 0; /* fresh start, no backoff yet */
         dispatch_event(STA_MGR_EVENT_STA_START, NULL);
-        esp_wifi_connect();
         dispatch_event(STA_MGR_EVENT_STA_CONNECTING, NULL);
+        esp_wifi_connect();
         break;
 
     case WIFI_EVENT_STA_CONNECTED:
@@ -138,14 +207,41 @@ static void handle_wifi_event(int32_t event_id)
         break;
 
     case WIFI_EVENT_STA_DISCONNECTED:
+    {
         if (s_prov_active)
             break;
-        ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
         xEventGroupClearBits(s_sta_event_group, STA_CONNECTED_BIT);
-        dispatch_event(STA_MGR_EVENT_STA_DISCONNECTED, NULL);
-        esp_wifi_connect();
-        dispatch_event(STA_MGR_EVENT_STA_CONNECTING, NULL);
+
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+        sta_mgr_disconnect_t info = {.reason = disc ? disc->reason : 0};
+        dispatch_event(STA_MGR_EVENT_STA_DISCONNECTED, &info);
+
+#ifdef CONFIG_ESP_STA_MGR_RESET_ON_FAILURE
+        if (disc && is_credential_failure_reason(disc->reason))
+        {
+            s_auth_fail_count++;
+            ESP_LOGW(TAG, "Credential-type disconnect (reason %u), attempt %u/%u", disc->reason, s_auth_fail_count, (unsigned)CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS);
+
+            if (s_auth_fail_count >= CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS)
+            {
+                ESP_LOGE(TAG, "Max connection attempts reached, clearing stored credentials");
+                s_auth_fail_count = 0;
+                esp_timer_stop(s_reconnect_timer); /* stop retrying with the bad credentials */
+                dispatch_event(STA_MGR_EVENT_RECONNECT_EXHAUSTED, NULL);
+                sta_manager_reset_credentials();
+                /* No schedule_reconnect() here — credentials are gone, the
+                 * app should react (e.g. restart into provisioning mode). */
+                break;
+            }
+        }
+        else
+        {
+            s_auth_fail_count = 0; /* transient reason (e.g. beacon timeout) — reset the streak */
+        }
+#endif
+        schedule_reconnect(); /* STA_MGR_EVENT_STA_CONNECTING fires when the timer expires */
         break;
+    }
 
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_SOFTAP
     /* ── AP events — only relevant while provisioning is active ───────── */
@@ -157,8 +253,8 @@ static void handle_wifi_event(int32_t event_id)
         break;
 
     case WIFI_EVENT_AP_STADISCONNECTED:
-        /* Ignore if provisioning is done or credentials already accepted —
-         * the phone disconnects from the AP as part of the normal flow
+        /* Ignore if provisioning already ended or credentials were accepted —
+         * the phone disconnects from the AP as a normal part of the flow
          * after submitting credentials, before NETWORK_PROV_END fires. */
         if (!s_prov_active || s_prov_cred_ok)
             break;
@@ -180,7 +276,7 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
     }
     else if (base == WIFI_EVENT)
     {
-        handle_wifi_event(id);
+        handle_wifi_event(id, data);
     }
     else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
     {
@@ -193,6 +289,8 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         sta_manager_get_ssid(info.ssid, sizeof(info.ssid));
 
         ESP_LOGI(TAG, "Got IP: %s", info.ip);
+        s_reconnect_attempts = 0; /* connection recovered, reset backoff */
+        s_auth_fail_count = 0;    /* credentials are good, reset the failure streak */
         xEventGroupSetBits(s_sta_event_group, STA_CONNECTED_BIT);
         dispatch_event(STA_MGR_EVENT_STA_GOT_IP, &info);
     }
@@ -255,8 +353,8 @@ void sta_manager_get_service_name(char *name, size_t max)
 }
 
 #ifdef CONFIG_ESP_STA_MGR_CUSTOM_ENDPOINT
-/* Custom provisioning endpoint — called after the SRP handshake.
- * outbuf must be heap-allocated; protocomm frees it after send. */
+/* Custom provisioning endpoint, called after the SRP handshake.
+ * outbuf must be heap-allocated; protocomm frees it after sending. */
 static esp_err_t custom_prov_handler(uint32_t session_id, const uint8_t *inbuf, ssize_t inlen, uint8_t **outbuf, ssize_t *outlen, void *priv_data)
 {
     if (inbuf)
@@ -291,35 +389,33 @@ esp_err_t sta_manager_init(const sta_manager_config_t *config)
 
     ESP_LOGI(TAG, "Initializing STA Manager");
 
-    if (config)
-    {
-        /* service_name == NULL with a non-NULL config is a caller bug. */
-        assert(config->service_name != NULL);
-
-#ifdef CONFIG_ESP_STA_MGR_PROV_SECURITY_1
-        if (!config->sec1_pop || config->sec1_pop[0] == '\0')
-        {
-            ESP_LOGE(TAG, "sec1_pop must be a non-empty string");
-            return ESP_ERR_INVALID_ARG;
-        }
-#endif
-
-#ifdef CONFIG_ESP_STA_MGR_PROV_SECURITY_2
-        if (!config->sec2_salt || config->sec2_salt_len == 0 ||
-            !config->sec2_verifier || config->sec2_verifier_len == 0)
-        {
-            ESP_LOGE(TAG, "Sec2 credentials incomplete (salt=%p len=%u  verifier=%p len=%u)", config->sec2_salt, config->sec2_salt_len, config->sec2_verifier, config->sec2_verifier_len);
-            return ESP_ERR_INVALID_ARG;
-        }
-#endif
-        memcpy(&s_config, config, sizeof(sta_manager_config_t));
-    }
-    else
+    if (!config)
     {
         /* NULL config is always invalid — credentials must be set explicitly. */
         ESP_LOGE(TAG, "NULL config — provide sec1_pop (Sec1) or sec2_salt/sec2_verifier (Sec2)");
         return ESP_ERR_INVALID_ARG;
     }
+
+    /* service_name == NULL with a non-NULL config is a caller bug. */
+    assert(config->service_name != NULL);
+
+#ifdef CONFIG_ESP_STA_MGR_PROV_SECURITY_1
+    if (!config->sec1_pop || config->sec1_pop[0] == '\0')
+    {
+        ESP_LOGE(TAG, "sec1_pop must be a non-empty string");
+        return ESP_ERR_INVALID_ARG;
+    }
+#endif
+
+#ifdef CONFIG_ESP_STA_MGR_PROV_SECURITY_2
+    if (!config->sec2_salt || config->sec2_salt_len == 0 ||
+        !config->sec2_verifier || config->sec2_verifier_len == 0)
+    {
+        ESP_LOGE(TAG, "Sec2 credentials incomplete (salt=%p len=%u  verifier=%p len=%u)", config->sec2_salt, config->sec2_salt_len, config->sec2_verifier, config->sec2_verifier_len);
+        return ESP_ERR_INVALID_ARG;
+    }
+#endif
+    memcpy(&s_config, config, sizeof(sta_manager_config_t));
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -330,6 +426,12 @@ esp_err_t sta_manager_init(const sta_manager_config_t *config)
         ESP_LOGE(TAG, "Failed to create event group (out of memory)");
         abort();
     }
+
+    const esp_timer_create_args_t reconnect_timer_args = {
+        .callback = &reconnect_timer_cb,
+        .name = "sta_mgr_reconnect",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&reconnect_timer_args, &s_reconnect_timer));
 
     ESP_ERROR_CHECK(esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
@@ -344,22 +446,13 @@ esp_err_t sta_manager_init(const sta_manager_config_t *config)
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_SOFTAP
     esp_netif_create_default_wifi_ap();
     /* SoftAP needs WIFI_EVENT from the start to receive AP_STA* events
-     * during provisioning. BLE registers it later in NETWORK_PROV_END. */
+     * during provisioning. BLE registers it later, in NETWORK_PROV_END. */
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
 #endif
 
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
 
-    /* NOTE: the retry-count field previously set here (.wifi_prov_conn_cfg /
-     * .wifi_conn_attempts) does not exist on network_prov_mgr_config_t in
-     * network_provisioning 1.2.2 — confirmed by the v6.0 build log ("has no
-     * member named 'wifi_prov_conn_cfg'"). Removed for now so the manager
-     * uses the library default retry count instead of
-     * CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS. To restore this behavior, open
-     * managed_components/espressif__network_provisioning/include/
-     * network_provisioning/manager.h, find the renamed field (grep for
-     * "conn_attempts"), and re-add it here with its real name. */
     network_prov_mgr_config_t prov_cfg = {
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
         .scheme = network_prov_scheme_ble,
@@ -391,22 +484,14 @@ esp_err_t sta_manager_start(void)
         s_prov_active = true; /* block STA events until provisioning ends */
         ESP_LOGI(TAG, "Not provisioned, starting provisioning");
 
-        char service_name[strnlen(s_config.service_name, 32) + 7];
+        char service_name[SERVICE_NAME_MAX_LEN];
         sta_manager_get_service_name(service_name, sizeof(service_name));
 
-        /* No unconditional default here — NETWORK_PROV_SECURITY_1 only
-         * exists when CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1 is
-         * enabled (disabled by default in v6.0). Only the matching #if/#elif
-         * branch below assigns this. */
         network_prov_security_t security;
         const void *sec_params = NULL;
 
 #if defined(CONFIG_ESP_STA_MGR_PROV_SECURITY_1)
         security = NETWORK_PROV_SECURITY_1;
-        /* TODO: verify against manager.h that Security 1 still takes the PoP
-         * as a raw string cast this way. If network_prov_security1_params_t
-         * is now a real struct (not just an alias for const char*), this
-         * cast needs to change accordingly. */
         sec_params = (network_prov_security1_params_t *)s_config.sec1_pop;
 
 #elif defined(CONFIG_ESP_STA_MGR_PROV_SECURITY_2)
@@ -416,17 +501,28 @@ esp_err_t sta_manager_start(void)
         s_sec2_params.verifier_len = s_config.sec2_verifier_len;
         security = NETWORK_PROV_SECURITY_2;
         sec_params = &s_sec2_params;
-
 #endif
 
+#ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_SOFTAP
+        /* Password for the SoftAP network itself (WPA2). Independent of the
+         * Security 1/2 protocomm encryption below, which protects the
+         * credential exchange either way. Empty string -> open network. */
+        const char *service_key = (strlen(CONFIG_ESP_STA_MGR_SOFTAP_PASSWORD) > 0) ? CONFIG_ESP_STA_MGR_SOFTAP_PASSWORD : NULL;
+#else
         const char *service_key = NULL;
+#endif
 
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
-        uint8_t custom_uuid[] = {
+        /* Fallback UUID used only if the app doesn't supply its own via
+         * config.ble_service_uuid. Reused across every project built on this
+         * component unless overridden — override it per-product so devices
+         * from different products don't advertise an identical BLE identity. */
+        static const uint8_t s_default_ble_uuid[16] = {
             0xb4, 0xdf, 0x5a, 0x1c, 0x3f, 0x6b, 0xf4, 0xbf,
             0xea, 0x4a, 0x82, 0x03, 0x04, 0x90, 0x1a, 0x02};
 
-        network_prov_scheme_ble_set_service_uuid(custom_uuid);
+        const uint8_t *uuid = s_config.ble_service_uuid ? s_config.ble_service_uuid : s_default_ble_uuid;
+        ESP_ERROR_CHECK(network_prov_scheme_ble_set_service_uuid((uint8_t *)uuid));
 #endif
 
 #ifdef CONFIG_ESP_STA_MGR_CUSTOM_ENDPOINT
@@ -489,9 +585,6 @@ esp_err_t sta_manager_reset_credentials(void)
 {
     ESP_LOGW(TAG, "Resetting WiFi credentials");
 
-    /* Best-guess name, following the same "_wifi_" naming pattern confirmed
-     * for network_prov_mgr_is_wifi_provisioned(). If the compiler rejects
-     * this, it will suggest the real name via "did you mean" — swap it in. */
     esp_err_t ret = network_prov_mgr_reset_wifi_provisioning();
     if (ret != ESP_OK)
     {
@@ -524,6 +617,13 @@ esp_err_t sta_manager_deinit(void)
     esp_event_handler_unregister(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID, &event_handler);
 #endif
 
+    if (s_reconnect_timer)
+    {
+        esp_timer_stop(s_reconnect_timer); /* no-op if not running */
+        esp_timer_delete(s_reconnect_timer);
+        s_reconnect_timer = NULL;
+    }
+
     esp_err_t ret = esp_wifi_stop();
     if (ret != ESP_OK)
         ESP_LOGW(TAG, "esp_wifi_stop: %s", esp_err_to_name(ret));
@@ -542,6 +642,8 @@ esp_err_t sta_manager_deinit(void)
     s_initialized = false;
     s_prov_active = false;
     s_prov_cred_ok = false;
+    s_reconnect_attempts = 0;
+    s_auth_fail_count = 0;
 
     ESP_LOGI(TAG, "Deinitialization complete");
     return ESP_OK;

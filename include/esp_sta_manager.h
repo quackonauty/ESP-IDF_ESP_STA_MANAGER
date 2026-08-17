@@ -26,6 +26,9 @@ extern "C"
         STA_MGR_EVENT_STA_CONNECTED,
         STA_MGR_EVENT_STA_DISCONNECTED,
         STA_MGR_EVENT_STA_GOT_IP,
+        STA_MGR_EVENT_RECONNECT_EXHAUSTED, /* CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS credential-type
+                                             * disconnects in a row -> credentials were cleared
+                                             * (only fires if CONFIG_ESP_STA_MGR_RESET_ON_FAILURE) */
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
         STA_MGR_EVENT_BLE_CONNECTED,
         STA_MGR_EVENT_BLE_DISCONNECTED,
@@ -45,6 +48,15 @@ extern "C"
     {
         const char *reason;
     } sta_mgr_prov_fail_t;
+
+    /** @brief Event data for STA_MGR_EVENT_STA_DISCONNECTED.
+     *  reason is the raw wifi_err_reason_t code from the WIFI_EVENT_STA_DISCONNECTED
+     *  event (see esp_wifi_types.h), exposed so the app can distinguish a
+     *  credentials/auth problem from a transient signal issue if it wants to. */
+    typedef struct
+    {
+        uint16_t reason;
+    } sta_mgr_disconnect_t;
 
     typedef struct
     {
@@ -82,6 +94,15 @@ extern "C"
         const char *service_name;
         bool append_mac_suffix;
 
+#ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
+        /** 16-byte BLE service UUID advertised during provisioning.
+         *  NULL = use the component's built-in default UUID.
+         *  IMPORTANT: if you reuse this component across several products,
+         *  give each product its own UUID here — otherwise every device
+         *  built from this base advertises the same identity over BLE. */
+        const uint8_t *ble_service_uuid;
+#endif
+
 #ifdef CONFIG_ESP_STA_MGR_PROV_SECURITY_1
         const char *sec1_pop;
 #endif
@@ -112,29 +133,43 @@ extern "C"
      *   cfg.sec2_verifier_len = sizeof(s_sec2_verifier);
      * @endcode
      */
+#ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_BLE
+#define STA_MANAGER_CONFIG_DEFAULT_BLE_UUID() .ble_service_uuid = NULL,
+#else
+#define STA_MANAGER_CONFIG_DEFAULT_BLE_UUID()
+#endif
+
 #ifdef CONFIG_ESP_STA_MGR_PROV_SECURITY_1
-#define STA_MANAGER_CONFIG_DEFAULT() { \
-    .event_cb = NULL,                  \
-    .user_data = NULL,                 \
-    .service_name = NULL,              \
-    .append_mac_suffix = false,        \
-    .sec1_pop = NULL,                  \
+#define STA_MANAGER_CONFIG_DEFAULT() {   \
+    .event_cb = NULL,                    \
+    .user_data = NULL,                   \
+    .service_name = NULL,                \
+    .append_mac_suffix = false,          \
+    STA_MANAGER_CONFIG_DEFAULT_BLE_UUID()\
+    .sec1_pop = NULL,                    \
 }
 #elif defined(CONFIG_ESP_STA_MGR_PROV_SECURITY_2)
-#define STA_MANAGER_CONFIG_DEFAULT() { \
-    .event_cb = NULL,                  \
-    .user_data = NULL,                 \
-    .service_name = NULL,              \
-    .append_mac_suffix = false,        \
-    .sec2_salt = NULL,                 \
-    .sec2_salt_len = 0,                \
-    .sec2_verifier = NULL,             \
-    .sec2_verifier_len = 0,            \
+#define STA_MANAGER_CONFIG_DEFAULT() {   \
+    .event_cb = NULL,                    \
+    .user_data = NULL,                   \
+    .service_name = NULL,                \
+    .append_mac_suffix = false,          \
+    STA_MANAGER_CONFIG_DEFAULT_BLE_UUID()\
+    .sec2_salt = NULL,                   \
+    .sec2_salt_len = 0,                  \
+    .sec2_verifier = NULL,               \
+    .sec2_verifier_len = 0,              \
 }
 #endif
 
     /* ============================================================================
      * API
+     *
+     * @note Not thread-safe. Internal state is written both from whichever
+     *       task calls these functions and from the default esp_event loop
+     *       task (WiFi/provisioning callbacks). Call sta_manager_* functions
+     *       from a single task (typically app_main), or add your own locking
+     *       if you call them from more than one place.
      * ========================================================================= */
 
     /**
