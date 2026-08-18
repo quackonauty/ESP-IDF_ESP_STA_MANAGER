@@ -3,7 +3,7 @@
 | Supported Targets | ESP32 | ESP32-S2 | ESP32-S3 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 |
 | ----------------- | ----- | -------- | -------- | -------- | -------- | -------- | -------- | --------- | -------- |
 
-![Version](https://img.shields.io/badge/version-2.1.0-blue)
+![Version](https://img.shields.io/badge/version-2.2.0-blue)
 
 An ESP-IDF component that handles WiFi provisioning (BLE or SoftAP) and the full connection lifecycle — including automatic reconnection and event-driven state callbacks.
 
@@ -121,7 +121,7 @@ Both cores share the same RAM heap and peripherals — use mutexes when accessin
 ### Step 1: Add Component
 
 ```bash
-idf.py add-dependency --git https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git --git-ref 2.1.0 qck_esp_sta_manager
+idf.py add-dependency --git https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git --git-ref 2.2.0 qck_esp_sta_manager
 ```
 
 Or in `main/idf_component.yml`:
@@ -130,7 +130,7 @@ Or in `main/idf_component.yml`:
 dependencies:
   qck_esp_sta_manager:
     git: https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git
-    version: 2.1.0
+    version: 2.2.0
 ```
 
 ### Step 2: Partition Table
@@ -209,6 +209,7 @@ Navigate to: **Component config → ESP STA Manager**
 | Reset on failure | Enabled | Clears stored credentials after `Max connection attempts` consecutive credential-type disconnects |
 | Max connection attempts | 5 | Consecutive auth/AP-not-found disconnects (operational reconnects, not provisioning) before credentials are cleared — visible only when reset is enabled |
 | SoftAP password | *(empty)* | WPA2 password for the SoftAP network itself (SoftAP transport only) — empty means an open network. Independent of the Security 1/2 protocomm encryption |
+| WiFi power-save mode | Minimum modem sleep | None / Min modem / Max modem — trade-off between latency (matters if you run a server on top of this) and power draw |
 | Log level | Info | Component verbosity |
 
 > **Service name and MAC suffix** are configured at runtime via `sta_manager_config_t` — not in Kconfig. This ensures the caller always sets them explicitly.
@@ -710,6 +711,7 @@ print(to_c_array("s_verifier", verifier))
 | `sta_manager_get_ip_info(info)` | Get current IP, netmask, gateway, and SSID |
 | `sta_manager_get_ssid(ssid, len)` | Get connected AP SSID |
 | `sta_manager_get_service_name(name, max)` | Get full service name (with MAC suffix if enabled) |
+| `sta_manager_get_reconnect_status(attempts, auth_fails)` | Get the current backoff/failure counters — **thread-safe**, callable from any task |
 
 ### Configuration
 
@@ -840,6 +842,14 @@ $IDF_PATH/components/esptool_py/esptool/esptool.py erase_region 0x9000 0x6000
 ---
 
 ## Changelog
+
+### 2.2.0
+
+- **New**: `sta_manager_get_reconnect_status(attempts, auth_fails)` — read the current backoff/failure counters from any task (e.g. to show "Retrying 3/5" on a display). This is the one function in the API that's safe to call from a task other than the one driving the rest of the API.
+- **New**: `CONFIG_ESP_STA_MGR_WIFI_PS_MODE` choice (None / Min modem / Max modem, default Min modem — same as the previous unconfigurable behavior) so latency-sensitive apps (e.g. running a WebSocket/HTTP server on top of this connection) can disable modem sleep without patching the component.
+- **Fix**: `sta_manager_get_service_name()` ignored the return value of `esp_wifi_get_mac()`; a failed read left the MAC suffix as uninitialized stack memory. It now zero-initializes the buffer and logs a warning on failure, falling back to a `000000` suffix.
+- **Improve**: the reconnect/auth-failure counters are now protected by a spinlock (`portMUX_TYPE`), since they're written from the default event-loop task and are now also readable from any caller task via the new getter.
+- No breaking changes.
 
 ### 2.1.0
 

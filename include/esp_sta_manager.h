@@ -165,11 +165,14 @@ extern "C"
     /* ============================================================================
      * API
      *
-     * @note Not thread-safe. Internal state is written both from whichever
-     *       task calls these functions and from the default esp_event loop
-     *       task (WiFi/provisioning callbacks). Call sta_manager_* functions
-     *       from a single task (typically app_main), or add your own locking
-     *       if you call them from more than one place.
+     * @note Mostly not thread-safe. Call sta_manager_* functions from a
+     *       single task (typically app_main), or add your own locking if you
+     *       call them from more than one place. The one exception is
+     *       sta_manager_get_reconnect_status(), which is safe to call from
+     *       any task — the counters it reads are protected by an internal
+     *       spinlock since they're written from the default esp_event loop
+     *       task (WiFi callbacks) while typically being read from wherever
+     *       you render status (e.g. a display-update task).
      * ========================================================================= */
 
     /**
@@ -234,6 +237,19 @@ extern "C"
      * @return ESP_OK, ESP_ERR_INVALID_ARG, or ESP_ERR_INVALID_STATE
      */
     esp_err_t sta_manager_get_ip_info(sta_mgr_ip_info_t *info);
+
+    /**
+     * @brief Get the current reconnect/failure counters (e.g. for a status display).
+     *
+     * Thread-safe — unlike the rest of this API, safe to call from any task.
+     *
+     * @param[out] attempts    Consecutive reconnect attempts since the last successful
+     *                         connection (backoff counter). NULL to skip.
+     * @param[out] auth_fails  Consecutive credential-type disconnects counted toward
+     *                         CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS. NULL to skip.
+     * @return ESP_OK, or ESP_ERR_INVALID_ARG if both out-params are NULL
+     */
+    esp_err_t sta_manager_get_reconnect_status(uint8_t *attempts, uint8_t *auth_fails);
 
     /**
      * @brief Get the full service name (with MAC suffix if enabled).

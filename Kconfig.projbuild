@@ -131,6 +131,28 @@ menu "ESP STA Manager"
             automatic reconnect attempts.
 
     # -------------------------------------------------------------------------
+    # WiFi Power Save
+    # -------------------------------------------------------------------------
+
+    choice ESP_STA_MGR_WIFI_PS_MODE
+        prompt "WiFi power-save mode"
+        default ESP_STA_MGR_WIFI_PS_MIN_MODEM
+        help
+            Trade-off between power consumption and latency/jitter once
+            connected. Matters most if you run a server (HTTP, WebSocket,
+            ...) on top of this connection — modem sleep can add tens of
+            milliseconds of variable latency per packet.
+
+        config ESP_STA_MGR_WIFI_PS_NONE
+            bool "None (lowest latency, highest power draw)"
+        config ESP_STA_MGR_WIFI_PS_MIN_MODEM
+            bool "Minimum modem sleep (ESP-IDF default)"
+        config ESP_STA_MGR_WIFI_PS_MAX_MODEM
+            bool "Maximum modem sleep (lowest power, highest latency)"
+
+    endchoice
+
+    # -------------------------------------------------------------------------
     # Log Level
     # -------------------------------------------------------------------------
 

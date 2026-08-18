@@ -70,6 +70,16 @@ static inline void dispatch_event(sta_mgr_event_t event, void *data)
  * avoid the extra stack/RAM cost.
  * ========================================================================= */
 
+/* Protects s_reconnect_attempts / s_auth_fail_count, the only pieces of
+ * state that are realistically written from the event-loop task (WiFi
+ * events) while being read from the caller's own task (via
+ * sta_manager_get_reconnect_status()). Everything else in this file is
+ * either only ever touched from the default event-loop task, or is only
+ * meant to be touched from a single caller task per the header's
+ * thread-safety note — a spinlock is enough here since every critical
+ * section below is a handful of instructions, never blocking. */
+static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
+
 static esp_timer_handle_t s_reconnect_timer = NULL;
 static uint8_t s_reconnect_attempts = 0;
 
@@ -109,13 +119,15 @@ static inline bool is_credential_failure_reason(uint8_t reason)
 
 static void schedule_reconnect(void)
 {
-    uint32_t delay_ms = CONFIG_ESP_STA_MGR_RECONNECT_BASE_DELAY_MS << s_reconnect_attempts;
+    taskENTER_CRITICAL(&s_state_lock);
+    uint8_t attempts = s_reconnect_attempts;
+    if (s_reconnect_attempts < 16) /* cap the shift; delay is already clamped below */
+        s_reconnect_attempts++;
+    taskEXIT_CRITICAL(&s_state_lock);
 
+    uint32_t delay_ms = CONFIG_ESP_STA_MGR_RECONNECT_BASE_DELAY_MS << attempts;
     if (delay_ms > CONFIG_ESP_STA_MGR_RECONNECT_MAX_DELAY_MS || delay_ms == 0 /* overflow */)
         delay_ms = CONFIG_ESP_STA_MGR_RECONNECT_MAX_DELAY_MS;
-
-    if (s_reconnect_attempts < 16) /* cap the shift; delay is already clamped above */
-        s_reconnect_attempts++;
 
     ESP_LOGW(TAG, "WiFi disconnected, retrying in %" PRIu32 " ms", delay_ms);
     esp_timer_stop(s_reconnect_timer); /* no-op if not running */
@@ -193,7 +205,9 @@ static void handle_wifi_event(int32_t event_id, void *event_data)
         if (s_prov_active)
             break;
         ESP_LOGI(TAG, "WiFi STA started");
+        taskENTER_CRITICAL(&s_state_lock);
         s_reconnect_attempts = 0; /* fresh start, no backoff yet */
+        taskEXIT_CRITICAL(&s_state_lock);
         dispatch_event(STA_MGR_EVENT_STA_START, NULL);
         dispatch_event(STA_MGR_EVENT_STA_CONNECTING, NULL);
         esp_wifi_connect();
@@ -219,13 +233,18 @@ static void handle_wifi_event(int32_t event_id, void *event_data)
 #ifdef CONFIG_ESP_STA_MGR_RESET_ON_FAILURE
         if (disc && is_credential_failure_reason(disc->reason))
         {
-            s_auth_fail_count++;
-            ESP_LOGW(TAG, "Credential-type disconnect (reason %u), attempt %u/%u", disc->reason, s_auth_fail_count, (unsigned)CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS);
+            taskENTER_CRITICAL(&s_state_lock);
+            uint8_t fail_count = ++s_auth_fail_count;
+            taskEXIT_CRITICAL(&s_state_lock);
 
-            if (s_auth_fail_count >= CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS)
+            ESP_LOGW(TAG, "Credential-type disconnect (reason %u), attempt %u/%u", disc->reason, fail_count, (unsigned)CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS);
+
+            if (fail_count >= CONFIG_ESP_STA_MGR_MAX_CONN_ATTEMPTS)
             {
                 ESP_LOGE(TAG, "Max connection attempts reached, clearing stored credentials");
+                taskENTER_CRITICAL(&s_state_lock);
                 s_auth_fail_count = 0;
+                taskEXIT_CRITICAL(&s_state_lock);
                 esp_timer_stop(s_reconnect_timer); /* stop retrying with the bad credentials */
                 dispatch_event(STA_MGR_EVENT_RECONNECT_EXHAUSTED, NULL);
                 sta_manager_reset_credentials();
@@ -236,7 +255,9 @@ static void handle_wifi_event(int32_t event_id, void *event_data)
         }
         else
         {
+            taskENTER_CRITICAL(&s_state_lock);
             s_auth_fail_count = 0; /* transient reason (e.g. beacon timeout) — reset the streak */
+            taskEXIT_CRITICAL(&s_state_lock);
         }
 #endif
         schedule_reconnect(); /* STA_MGR_EVENT_STA_CONNECTING fires when the timer expires */
@@ -289,8 +310,10 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
         sta_manager_get_ssid(info.ssid, sizeof(info.ssid));
 
         ESP_LOGI(TAG, "Got IP: %s", info.ip);
+        taskENTER_CRITICAL(&s_state_lock);
         s_reconnect_attempts = 0; /* connection recovered, reset backoff */
         s_auth_fail_count = 0;    /* credentials are good, reset the failure streak */
+        taskEXIT_CRITICAL(&s_state_lock);
         xEventGroupSetBits(s_sta_event_group, STA_CONNECTED_BIT);
         dispatch_event(STA_MGR_EVENT_STA_GOT_IP, &info);
     }
@@ -341,8 +364,11 @@ void sta_manager_get_service_name(char *name, size_t max)
 
     if (s_config.append_mac_suffix)
     {
-        uint8_t mac[6];
-        esp_wifi_get_mac(WIFI_IF_STA, mac);
+        uint8_t mac[6] = {0}; /* zeroed so a failed read below falls back to a "000000" suffix
+                               * instead of leftover stack garbage */
+        esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, mac);
+        if (ret != ESP_OK)
+            ESP_LOGW(TAG, "esp_wifi_get_mac failed (%s), using 000000 suffix", esp_err_to_name(ret));
         snprintf(name, max, "%s%02X%02X%02X", s_config.service_name, mac[3], mac[4], mac[5]);
     }
     else
@@ -373,6 +399,17 @@ static void wifi_init_sta(void)
 {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* esp_wifi_set_ps() must be called after esp_wifi_start(). Power-save
+     * trades latency/jitter for battery life — matters most if the app runs
+     * a server (HTTP, WebSocket, ...) on top of this connection. */
+#if defined(CONFIG_ESP_STA_MGR_WIFI_PS_NONE)
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+#elif defined(CONFIG_ESP_STA_MGR_WIFI_PS_MAX_MODEM)
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MAX_MODEM));
+#else
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM)); /* ESP-IDF default */
+#endif
 }
 
 /* ============================================================================
@@ -642,8 +679,10 @@ esp_err_t sta_manager_deinit(void)
     s_initialized = false;
     s_prov_active = false;
     s_prov_cred_ok = false;
+    taskENTER_CRITICAL(&s_state_lock);
     s_reconnect_attempts = 0;
     s_auth_fail_count = 0;
+    taskEXIT_CRITICAL(&s_state_lock);
 
     ESP_LOGI(TAG, "Deinitialization complete");
     return ESP_OK;
@@ -662,6 +701,21 @@ esp_err_t sta_manager_get_ssid(char *ssid, size_t len)
         ssid[len - 1] = '\0';
     }
     return ret;
+}
+
+esp_err_t sta_manager_get_reconnect_status(uint8_t *attempts, uint8_t *auth_fails)
+{
+    if (!attempts && !auth_fails)
+        return ESP_ERR_INVALID_ARG;
+
+    taskENTER_CRITICAL(&s_state_lock);
+    if (attempts)
+        *attempts = s_reconnect_attempts;
+    if (auth_fails)
+        *auth_fails = s_auth_fail_count;
+    taskEXIT_CRITICAL(&s_state_lock);
+
+    return ESP_OK;
 }
 
 esp_err_t sta_manager_get_ip_info(sta_mgr_ip_info_t *info)
