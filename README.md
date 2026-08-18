@@ -3,7 +3,7 @@
 | Supported Targets | ESP32 | ESP32-S2 | ESP32-S3 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 |
 | ----------------- | ----- | -------- | -------- | -------- | -------- | -------- | -------- | --------- | -------- |
 
-![Version](https://img.shields.io/badge/version-2.2.0-blue)
+![Version](https://img.shields.io/badge/version-2.3.0-blue)
 
 An ESP-IDF component that handles WiFi provisioning (BLE or SoftAP) and the full connection lifecycle — including automatic reconnection and event-driven state callbacks.
 
@@ -121,7 +121,7 @@ Both cores share the same RAM heap and peripherals — use mutexes when accessin
 ### Step 1: Add Component
 
 ```bash
-idf.py add-dependency --git https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git --git-ref 2.2.0 qck_esp_sta_manager
+idf.py add-dependency --git https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git --git-ref 2.3.0 qck_esp_sta_manager
 ```
 
 Or in `main/idf_component.yml`:
@@ -130,7 +130,7 @@ Or in `main/idf_component.yml`:
 dependencies:
   qck_esp_sta_manager:
     git: https://github.com/quackonauty/ESP-IDF_ESP_STA_MANAGER.git
-    version: 2.2.0
+    version: 2.3.0
 ```
 
 ### Step 2: Partition Table
@@ -842,6 +842,12 @@ $IDF_PATH/components/esptool_py/esptool/esptool.py erase_region 0x9000 0x6000
 ---
 
 ## Changelog
+
+### 2.3.0
+
+- **Improve**: `sta_manager_get_ip_info()` now uses the STA netif handle cached at init instead of looking it up by ifkey string (`esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")`) on every call.
+- **Improve**: `CONFIG_ESP_STA_MGR_SOFTAP_PASSWORD` (SoftAP transport only) is now validated at runtime — a password of 1-7 characters (below WPA2's minimum) logs a warning and falls back to an open network instead of failing silently later inside `network_prov_mgr_start_provisioning()`.
+- No breaking changes.
 
 ### 2.2.0
 

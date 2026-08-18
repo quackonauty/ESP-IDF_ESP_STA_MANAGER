@@ -38,6 +38,8 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
 #define SERVICE_NAME_MAX_LEN 40 /* prefix + 6 hex MAC chars, fixed size (no VLA) */
 
 static EventGroupHandle_t s_sta_event_group = NULL;
+static esp_netif_t *s_sta_netif = NULL; /* cached handle from esp_netif_create_default_wifi_sta(),
+                                          * avoids an ifkey string lookup on every get_ip_info() call */
 static sta_manager_config_t s_config = {0};
 static bool s_initialized = false;
 static bool s_prov_active = false;  /* true while provisioning is in progress */
@@ -478,7 +480,7 @@ esp_err_t sta_manager_init(const sta_manager_config_t *config)
     ESP_ERROR_CHECK(esp_event_handler_register(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
 #endif
 
-    esp_netif_create_default_wifi_sta();
+    s_sta_netif = esp_netif_create_default_wifi_sta();
 
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_SOFTAP
     esp_netif_create_default_wifi_ap();
@@ -543,8 +545,20 @@ esp_err_t sta_manager_start(void)
 #ifdef CONFIG_ESP_STA_MGR_PROV_TRANSPORT_SOFTAP
         /* Password for the SoftAP network itself (WPA2). Independent of the
          * Security 1/2 protocomm encryption below, which protects the
-         * credential exchange either way. Empty string -> open network. */
-        const char *service_key = (strlen(CONFIG_ESP_STA_MGR_SOFTAP_PASSWORD) > 0) ? CONFIG_ESP_STA_MGR_SOFTAP_PASSWORD : NULL;
+         * credential exchange either way. Empty string -> open network.
+         * WPA2 requires 8+ chars — a shorter one is a config mistake, so we
+         * warn and fall back to open rather than let it fail silently deeper
+         * in network_prov_mgr_start_provisioning(). */
+        size_t softap_pw_len = strlen(CONFIG_ESP_STA_MGR_SOFTAP_PASSWORD);
+        const char *service_key = NULL;
+        if (softap_pw_len >= 8)
+        {
+            service_key = CONFIG_ESP_STA_MGR_SOFTAP_PASSWORD;
+        }
+        else if (softap_pw_len > 0)
+        {
+            ESP_LOGW(TAG, "CONFIG_ESP_STA_MGR_SOFTAP_PASSWORD is %u chars, WPA2 needs 8+ — using an open network instead", (unsigned)softap_pw_len);
+        }
 #else
         const char *service_key = NULL;
 #endif
@@ -675,6 +689,8 @@ esp_err_t sta_manager_deinit(void)
         s_sta_event_group = NULL;
     }
 
+    s_sta_netif = NULL; /* destroyed along with esp_wifi_deinit() above, drop the dangling cache */
+
     memset(&s_config, 0, sizeof(sta_manager_config_t));
     s_initialized = false;
     s_prov_active = false;
@@ -723,12 +739,11 @@ esp_err_t sta_manager_get_ip_info(sta_mgr_ip_info_t *info)
     if (!info)
         return ESP_ERR_INVALID_ARG;
 
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (!netif)
+    if (!s_sta_netif)
         return ESP_ERR_INVALID_STATE;
 
     esp_netif_ip_info_t ip_info;
-    esp_err_t ret = esp_netif_get_ip_info(netif, &ip_info);
+    esp_err_t ret = esp_netif_get_ip_info(s_sta_netif, &ip_info);
     if (ret == ESP_OK)
     {
         snprintf(info->ip, sizeof(info->ip), IPSTR, IP2STR(&ip_info.ip));
